@@ -1,0 +1,325 @@
+---
+title: "Make Figures of Evaluation Metrics"
+author: "Dan Kluger"
+date: "3/10/2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+
+
+```{r}
+#load datasets
+library(dplyr)
+
+datasetPath <- paste0(getwd(),"/Processed_Datasets/")
+load(paste0(datasetPath,"HousingPrice.RData"))
+load(paste0(datasetPath,"Treecover.RData"))
+load(paste0(datasetPath,"AlphaFold.RData"))
+AlphaFoldFormatted$GoodDat <- AlphaFoldFormatted$GoodDat %>% mutate(Interaction=`ubiq:acet_interaction`) %>% mutate(`ubiq:acet_interaction`=NULL)
+AlphaFoldFormatted$ProxyDat <- AlphaFoldFormatted$ProxyDat %>% mutate(Interaction=`ubiq:acet_interaction`) %>% mutate(`ubiq:acet_interaction`=NULL)
+
+ForestCoverFormatted <- TreecoverFormatted
+ForestCoverFormatted$GoodDat <- TreecoverFormatted$GoodDat %>% mutate(Forested=I(Treecover>10)) %>% mutate(Treecover=NULL)
+ForestCoverFormatted$ProxyDat <- TreecoverFormatted$ProxyDat %>% mutate(Forested=I(Treecover>10)) %>% mutate(Treecover=NULL)
+```
+
+
+
+```{r}
+#load results from simulations
+SimFolderLoad <- paste0(getwd(),"/SimulationResults/")
+load(paste0(SimFolderLoad,"ForestedLogRegSims.RData"))
+load(paste0(SimFolderLoad,"HousingPriceSims.RData"))
+load(paste0(SimFolderLoad,"AlphaFoldSims.RData"))
+load(paste0(SimFolderLoad,"TreecoverQuantile75Sims.RData"))
+load(paste0(SimFolderLoad,"SyntheticLinearRegSim.RData"))
+```
+
+```{r}
+#Calculate true values of target parameter using superpopulation data
+trueCoeffZSynth <- trueCoeffZSynth #Stored in SyntheticLinearRegSim.RData file
+
+trueCoeffNightlights <- lm(HousingPrice~.,data = HousingPriceFormatted$GoodDat)$coefficients[HousingPriceSims[[1]]$ParamOfInterest]
+
+
+InteractionCoeffAlphaFold <- glm(IDR~.,data = AlphaFoldFormatted$GoodDat,family = binomial(link = "logit"))$coefficients["Interaction"]
+
+trueCoeffPop <- glm(Forested~.,family = binomial(link = "logit"),data = ForestCoverFormatted$GoodDat)$coefficients[ForestedLogRegSims[[1]]$ParamOfInterest]
+
+
+trueQuantileTreecover <-  quantile(x = TreecoverFormatted$GoodDat$Treecover,probs = 0.75)
+
+```
+
+```{r}
+#Helper function for calculating emprical RMSE, Coverage and their standard errors
+getMetrics <- function(EstsAndCIs,groundTruth){
+  
+  #RMSE
+  EstsVec <- EstsAndCIs[,'Estimate']
+  SquaredErr <- (EstsVec-groundTruth)^2
+  RMSEout <- sqrt(mean(SquaredErr))  
+  AsympVarianceMSE <- var(SquaredErr)
+  AsympVarianceRMSE <- AsympVarianceMSE * (1/(4*mean(SquaredErr))) #Using Delta method
+  RMSE_SEOut <- sqrt(AsympVarianceRMSE/length(SquaredErr))
+  
+  
+  #Coverage
+    Covers <- I((EstsAndCIs[,'CI_ub'] >= groundTruth) & (EstsAndCIs[,'CI_lb'] <= groundTruth))
+    CoverageOut <- mean(Covers)
+    CoverageSEOut <- sqrt(mean(Covers)*(1-mean(Covers))/nrow(EstsAndCIs))
+  
+  return(list(RMSE=RMSEout,RMSE_SE=RMSE_SEOut,Coverage=CoverageOut,CoverageSE=CoverageSEOut))
+
+}
+```
+
+
+```{r}
+#Function that extracts all 3 evaluation metrics from an experiment
+#for each choice of K and adaptive sampling method
+extractSummaryMetrics1SimSet <- function(SimResultsInp,trueThetaInp,ExperimentName){
+  MetricColNames <- c("Experiment","Method","K","RMSE","EffSampleSizeVsUnif","Coverage","RMSE_SE","EffSampleSizeVsUnif_SE","Coverage_SE")
+  resultsSummaries <- data.frame(matrix(NA,nrow = (1+length(SimResultsInp)),ncol = length(MetricColNames) ))
+  
+  #Starting Table
+  names(resultsSummaries) <- MetricColNames
+  resultsSummaries[,'Experiment'] <- ExperimentName
+  
+  #Initiallizing baselines to store across all simulations
+  BaselinePTDStore <- matrix(NA,nrow = 0,ncol = 3)
+  colnames(BaselinePTDStore) <- c("Estimate", "CI_lb","CI_ub")
+
+  for(i in 1:length(SimResultsInp)){
+   
+    CurrSimResults <- SimResultsInp[[i]]$Results
+   
+     #Storing Baseline results PTD with unifrom sampling and a single wave (K=1) 
+    BaselinePTDStore <- rbind(BaselinePTDStore,CurrSimResults$CIsPTDUniform)
+
+    #Storing Simulation parameters
+    resultsSummaries[i,'K'] <-  SimResultsInp[[i]]$K
+    
+    if(SimResultsInp[[i]]$StrategyPostBurn=="NeymanUntunedPTD"){
+       resultsSummaries[i,'Method'] <-  "Active PTD (stratified)"
+    } else if(SimResultsInp[[i]]$StrategyPostBurn=="ActiveKNNUntunedPTD"){
+       resultsSummaries[i,'Method'] <-  "Active PTD (kNN)"
+    }
+
+    #Computing and storing metrics RMSEs
+    
+    
+    ActiveEstsCIs <- CurrSimResults$CIsActivePTD
+    MetricsCurr <- getMetrics(EstsAndCIs = ActiveEstsCIs,
+                                     groundTruth = trueThetaInp)
+
+    
+
+    resultsSummaries[i,'RMSE'] <- MetricsCurr$RMSE
+    resultsSummaries[i,'RMSE_SE'] <- MetricsCurr$RMSE_SE
+    
+    
+    resultsSummaries[i,'Coverage'] <- MetricsCurr$Coverage
+    resultsSummaries[i,'Coverage_SE'] <-  MetricsCurr$CoverageSE
+    
+    #Computing Effective Sample Size Gains
+    WidthsPTDUnif <- CurrSimResults$CIsPTDUniform[,'CI_ub']-CurrSimResults$CIsPTDUniform[,'CI_lb']
+    nPTDUnif_vec <- CurrSimResults$nLabelUniform
+    WidthsActivePTD <- ActiveEstsCIs[,'CI_ub']-ActiveEstsCIs[,'CI_lb']
+    nPTDActive_vec <- CurrSimResults$nLabelActive
+
+    RelNeffActivePTD <- ((WidthsPTDUnif/WidthsActivePTD)^2)*(nPTDUnif_vec/nPTDActive_vec)
+    resultsSummaries[i,'EffSampleSizeVsUnif'] <- mean(RelNeffActivePTD)
+    resultsSummaries[i,'EffSampleSizeVsUnif_SE'] <- sd(RelNeffActivePTD)/sqrt(nrow(ActiveEstsCIs))
+    
+    
+  }
+  
+  #Summarizing results from PTD baseline with uniform sampling (K=1)
+  resultsSummaries[i+1,'K'] <- 1
+  resultsSummaries[i+1,'Method'] <- "PTD (Uniform)"
+
+  #Getting RMSEs and and Coverage Metrics
+  MetricsPTDUnif <- getMetrics(EstsAndCIs = BaselinePTDStore,
+                                     groundTruth = trueThetaInp)
+  resultsSummaries[i+1,'RMSE'] <- MetricsPTDUnif$RMSE
+  resultsSummaries[i+1,'RMSE_SE'] <- MetricsPTDUnif$RMSE_SE
+  resultsSummaries[i+1,'Coverage'] <- MetricsPTDUnif$Coverage
+  resultsSummaries[i+1,'Coverage_SE'] <-  MetricsPTDUnif$CoverageSE
+  
+  
+    
+  #Relative effective sample size metrics
+  resultsSummaries[i+1,'EffSampleSizeVsUnif'] <- 1 #baseline
+  resultsSummaries[i+1,'EffSampleSizeVsUnif_SE'] <- 0 #baseline 
+  
+  return(resultsSummaries)
+}
+```
+
+
+
+
+```{r}
+#Extracting summaries of evaluation metrics from all 5 experiments
+SimList <- list()
+SimList[[1]] <- SyntheticRegSims
+SimList[[2]] <- HousingPriceSims
+SimList[[3]] <- AlphaFoldSims
+SimList[[4]] <- ForestedLogRegSims
+SimList[[5]] <- TreecoverQuantile75Sims
+
+ExperimentNames <- c("Synthetic","HousingPrice","AlphaFold","Forest Cover","Tree cover quantile")
+TrueThetaVec <- c(trueCoeffZSynth,trueCoeffNightlights,InteractionCoeffAlphaFold,trueCoeffPop,trueQuantileTreecover)
+
+SummaryDf <- extractSummaryMetrics1SimSet(SimResultsInp = SimList[[1]],
+                                   ExperimentName = ExperimentNames[1],
+                                   trueThetaInp = TrueThetaVec[1])
+for(j in 2:5){
+  SummariesCurrExperiment <- extractSummaryMetrics1SimSet(SimResultsInp = SimList[[j]],
+                                   ExperimentName = ExperimentNames[j],
+                                   trueThetaInp = TrueThetaVec[j])
+  SummaryDf <- rbind(SummaryDf,SummariesCurrExperiment)
+  
+}
+```
+
+
+
+
+```{r}
+#Normalize RMSE to be 1 for baseline
+SummaryDf$RMSE_normalized <- rep(NA,nrow(SummaryDf))
+SummaryDf$RMSE_normalizedSE <- rep(NA,nrow(SummaryDf))
+
+for(i in 1:nrow(SummaryDf)){
+  currExp <- SummaryDf$Experiment[i]
+  idxBaselineCurr <- which((SummaryDf$Experiment==currExp) & (SummaryDf$Method=="PTD (Uniform)"))
+  RMSEBase <- SummaryDf$RMSE[idxBaselineCurr]
+  SummaryDf$RMSE_normalized[i] <- SummaryDf$RMSE[i]/RMSEBase
+  SummaryDf$RMSE_normalizedSE[i] <- SummaryDf$RMSE_SE[i]/RMSEBase
+
+}
+```
+
+```{r}
+#Adjusting method and experiment names for figures
+SummaryDf$Sampling <- rep(NA,nrow(SummaryDf))
+SummaryDf$Sampling[SummaryDf$Method=="Active PTD (kNN)"] <- "Adaptive (with kNN)"
+SummaryDf$Sampling[SummaryDf$Method=="Active PTD (stratified)"] <- "Adaptive (stratified)"
+SummaryDf$Sampling[SummaryDf$Method=="PTD (Uniform)"] <- "Uniform"
+
+SummaryDf$Experiment[SummaryDf$Experiment=="HousingPrice"] <- "Housing Price"
+SummaryDf$Experiment[SummaryDf$Experiment=="Tree cover quantile"] <- "Tree Cover Quantile"
+
+#Setting factors to get desired order in figures
+SummaryDf$Experiment <- factor(SummaryDf$Experiment,levels = c("Synthetic","Housing Price","AlphaFold","Forest Cover","Tree Cover Quantile"))
+SummaryDf$Sampling <- factor(SummaryDf$Sampling,levels = c("Uniform","Adaptive (stratified)","Adaptive (with kNN)"))
+
+SummaryDf$MethodAndK <- factor(paste0(SummaryDf$Sampling," K=",SummaryDf$K),
+                            levels = c("Uniform K=1",
+                                       paste0("Adaptive (stratified) K=",c(2,6,26)),
+                                       paste0("Adaptive (with kNN) K=",c(2,6,26))))
+
+
+SummaryDf$Waves <- factor(SummaryDf$K)
+```
+
+
+Plot summaries (Figure 1)
+```{r}
+library(ggplot2)
+library(patchwork)
+
+legendName <- "Phase II sampling approach"
+greyCol <- "grey"
+BarColorVec <- c(greyCol,"#ADD8E6","#1fd655")
+
+
+backgroundTheme <- theme_bw()+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),legend.text = element_text(size=9),
+        legend.title = element_text(size=10),axis.text.y =element_text(size = 7),axis.title.y =element_text(size = 7.25),axis.text.x =element_text(size = 7))
+
+p1 <- ggplot(data = SummaryDf,aes(y=RMSE_normalized,x=MethodAndK,fill=Sampling))+scale_fill_manual(name=legendName,values = BarColorVec)+geom_bar(stat="identity",width=0.8)+geom_errorbar(aes(ymin=RMSE_normalized-2*RMSE_normalizedSE,ymax=RMSE_normalized+2*RMSE_normalizedSE,width=0.2))+facet_wrap(~Experiment,nrow=1)+xlab("")+backgroundTheme + ylab("RMSE") + geom_hline(yintercept = 1,linetype=2,col=greyCol)+
+  coord_cartesian(ylim = c(0.7, 1.3))+ scale_x_discrete(labels = c('1','2','6','26','2','6','26'), breaks=levels(SummaryDf$MethodAndK))+
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+
+
+p2 <- ggplot(data = SummaryDf,aes(y=EffSampleSizeVsUnif,x=MethodAndK,fill=Sampling))+geom_bar(stat="identity",width=0.8)+scale_fill_manual(name=legendName,values = BarColorVec)+geom_errorbar(aes(ymin=EffSampleSizeVsUnif-2*EffSampleSizeVsUnif_SE,ymax=EffSampleSizeVsUnif+2*EffSampleSizeVsUnif_SE,width=0.2))+facet_wrap(~Experiment,nrow=1)+xlab("")+ geom_hline(yintercept = 1,linetype=2,col=greyCol)+
+  coord_cartesian(ylim = c(0.8, 2))+backgroundTheme + ylab("Relative efficiency")+ theme(strip.text = element_blank(),strip.background = element_blank())+ scale_x_discrete(labels = c('1','2','6','26','2','6','26'), breaks=levels(SummaryDf$MethodAndK)) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+p3 <- ggplot(data = SummaryDf,aes(y=Coverage,x=MethodAndK,fill=Sampling))+geom_bar(stat="identity",width=0.8)+scale_fill_manual(name=legendName,values = BarColorVec)+geom_errorbar(aes(ymin=Coverage-2*Coverage_SE,ymax=Coverage+2*Coverage_SE,width=0.2))+facet_wrap(~Experiment,nrow=1)+xlab("") + backgroundTheme + 
+  coord_cartesian(ylim = c(0.6, 1))+geom_hline(yintercept = 0.9,linetype=2) + ylab("Empirical coverage") + theme(strip.text = element_blank(),strip.background = element_blank())+ scale_x_discrete(labels = c('1','2','6','26','2','6','26'), breaks=levels(SummaryDf$MethodAndK))+xlab("Number of waves in Phase II")+theme(axis.title.x =element_text(size = 9, margin = margin(t = 9, unit = "pt")))
+
+pltOut <- p1/p2/p3 +
+plot_layout(
+  guides = "collect", heights = c(1,1.1,1.15)  # merges legends
+) &
+theme(legend.position = "bottom",plot.margin = margin(t=6,b=6))
+  
+
+print(pltOut)
+ggsave(pltOut,filename = paste0(getwd(),"/Figures/ExperimentSummaries.pdf"))
+```
+
+
+Making histogram to check asymptotic normal approximation (Figure S1)
+
+```{r}
+pltNormality <- function(SimsListInp,KPlt=6){
+  par(mfrow=c(2,3))
+  
+  ExpNames <- names(SimsListInp)
+  StrategyPostBurnPlt <- rep("ActiveKNNUntunedPTD",length(ExpNames))
+  StrategyPostBurnPlt[ExpNames=="AlphaFold"] <- "NeymanUntunedPTD"
+  
+  for(i in 1:length(ExpNames)){
+    CurrExpsSims <- SimsListInp[[ExpNames[i]]]
+    ActiveEstimatorVec <- rep(NA,nrow(CurrExpsSims[[1]]$Results$CIsActivePTD))
+    for(j in 1:length(CurrExpsSims)){
+      if((CurrExpsSims[[j]]$K==KPlt) & (CurrExpsSims[[j]]$StrategyPostBurn==StrategyPostBurnPlt[i])){
+            ActiveEstimatorVec <- CurrExpsSims[[j]]$Results$CIsActivePTD[,'Estimate']
+      }
+    }
+    
+       ShapiroWilkPval <- shapiro.test(ActiveEstimatorVec)$p.value
+    
+    titleName <- paste0(ExpNames[i]," (p=",round(ShapiroWilkPval,4),")")
+    hist(ActiveEstimatorVec,breaks = 50,col = "cyan",main = titleName,probability = T,cex.main=1,xlab = "Multiwave PTD Estimator",las=1)
+    muEmp <- mean(ActiveEstimatorVec)
+    sdEmp <- sd(ActiveEstimatorVec)
+    xVec <- seq(min(ActiveEstimatorVec),max(ActiveEstimatorVec),length.out = 1000)
+    DensityVec <- dnorm(x = xVec,mean = muEmp,sd = sdEmp)
+    lines(xVec,DensityVec,col="red")
+    
+  }
+  
+  
+}
+```
+
+```{r}
+SimsAllList <- list(Synthetic=SyntheticRegSims,HousingPrice=HousingPriceSims,AlphaFold=AlphaFoldSims,Forest=ForestedLogRegSims,TreecoverQuantile=TreecoverQuantile75Sims)
+
+
+names(SimsAllList) <- c("Synthetic","Housing Price","AlphaFold","Forest Cover","Tree Cover Quantile")
+
+#save as pdf
+
+pdf(file = paste0(getwd(),"/Figures/EstimatorDistKis6.pdf"),height = 4)
+pltNormality(SimsListInp = SimsAllList,KPlt = 6)
+dev.off()
+```
