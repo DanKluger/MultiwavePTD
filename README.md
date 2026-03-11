@@ -15,7 +15,7 @@ If using software from this repository, please cite the corresponding paper:
 
 If using the processed datasets, please cite their original source rather than this github repository.
 
-The housing price, forest cover and tree cover datasets came from: 
+The housing price and tree cover datasets came from: 
 > Rolf, E., Proctor, J., Carleton, T., Bolliger, I., Shankar, V., Ishihara, M., Recht, B., and
 Hsiang, S. (2021a). A generalizable and accessible approach to machine learning with
 global satellite imagery. Nature Communications, 12(1):4392.
