@@ -1,0 +1,633 @@
+---
+title: "Run Two Phase Multiwave Experiments"
+author: "Dan Kluger"
+date: "03/10/2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+#load CLT based Weighted PTD Implementation
+codePath <- paste0(getwd(),"/WeightedPTDImplementation")
+fileNames <- list.files(codePath)
+for(curFile in fileNames){
+  source(paste0(codePath,"/",curFile))
+}
+```
+
+```{r}
+#load datasets
+datasetPath <- paste0(getwd(),"/Processed_Datasets/")
+load(paste0(datasetPath,"HousingPrice.RData"))
+load(paste0(datasetPath,"Treecover.RData"))
+load(paste0(datasetPath,"AlphaFold.RData"))
+```
+
+```{r}
+#Additional Dataset processing
+library(dplyr)
+
+AlphaFoldFormatted$GoodDat <- AlphaFoldFormatted$GoodDat %>% mutate(Interaction=`ubiq:acet_interaction`) %>% mutate(`ubiq:acet_interaction`=NULL)
+AlphaFoldFormatted$ProxyDat <- AlphaFoldFormatted$ProxyDat %>% mutate(Interaction=`ubiq:acet_interaction`) %>% mutate(`ubiq:acet_interaction`=NULL)
+
+ForestCoverFormatted <- TreecoverFormatted
+ForestCoverFormatted$GoodDat <- TreecoverFormatted$GoodDat %>% mutate(Forested=I(Treecover>10)) %>% mutate(Treecover=NULL)
+ForestCoverFormatted$ProxyDat <- TreecoverFormatted$ProxyDat %>% mutate(Forested=I(Treecover>10)) %>% mutate(Treecover=NULL)
+```
+
+
+Helper functions for implementing proxy assisted two-phase multiwave sampling in data-based experiments
+```{r}
+#Implement Phase 1 Sample. 
+#NOTE: This function keeps track of all data from units selected in Phase 1, 
+#Including strata and unobserved labels that can be collected in Phase 2
+Phase1Sampling <- function(GoodDatAll,ProxyDatAll,StrataAll=NULL,N){
+  idxPhase1 <- sample(1:nrow(GoodDatAll),size = N,replace = T)
+  GoodDatUnobs <- GoodDatAll[idxPhase1,]
+  GoodDatObs <- data.frame(matrix(NA,nrow=nrow(GoodDatUnobs),ncol=ncol(GoodDatUnobs)))
+  names(GoodDatObs) <- names(GoodDatUnobs)
+  datObs <- list(GoodDat=GoodDatObs,ProxyDat=ProxyDatAll[idxPhase1,],Pi=NULL,Iobs=NULL,StrataVec=StrataAll[idxPhase1])
+  DatPhase1 <- list(GoodDatUnobs=GoodDatUnobs,datObs=datObs)
+  
+  return(DatPhase1)
+}
+```
+
+```{r}
+#Calculate the weights using c_k, and the labelling probabilities and observation indicators from previous waves
+#This returns the multiwave inverse probability weights assuming there are no additional upcoming waves
+#and corresponds to Equation (16) in the paper
+ExtractWCurr <- function(DatObsCurrInp2,cVec){
+  Kcurr <- ncol(DatObsCurrInp2$Iobs)
+  cVecNormalized <- cVec[1:Kcurr]/sum(cVec[1:Kcurr])
+  WkMat <- matrix(NA,nrow = nrow(DatObsCurrInp2$Iobs),ncol = ncol(DatObsCurrInp2$Iobs))
+  WkMat[,1] <- DatObsCurrInp2$Iobs[,1]/DatObsCurrInp2$Pi[,1]
+  
+  if(Kcurr>1){
+    ProdPrev <- (1-DatObsCurrInp2$Iobs[,1])/(1-DatObsCurrInp2$Pi[,1])
+      for(k in 2:Kcurr){
+        WkMat[,k] <- ProdPrev*DatObsCurrInp2$Iobs[,k]/DatObsCurrInp2$Pi[,k]
+        ProdPrev <- ProdPrev*(1-DatObsCurrInp2$Iobs[,k])/(1-DatObsCurrInp2$Pi[,k])
+      }
+  }
+  
+  WVec <- rowSums(WkMat*matrix(rep(cVecNormalized,nrow(WkMat)),nrow = nrow(WkMat),byrow = TRUE))
+  return(WVec)
+}
+```
+
+
+```{r}
+#Compute KNN-based estimates of the (unstandardized, unclipped) 
+# greedy optimal sampling probabilities (See Section 4.2.1 in paper) 
+
+library(FNN)
+
+
+KNNActivePTDWave <- function(DiffInfluenceFunctionsCalib,DatObsCurrInp,WCurrInp,kInp=20){
+  NSamp <- nrow(DatObsCurrInp$ProxyDat)
+  IdxCompleteCurr <- rowSums(DatObsCurrInp$Iobs)>0
+  WCalib <- WCurrInp[IdxCompleteCurr]
+  ProxyDatStd <- scale(DatObsCurrInp$ProxyDat)
+  DatProxyCalibStd <- ProxyDatStd[IdxCompleteCurr,]
+
+  
+  if(ncol(DatObsCurrInp$Pi)==1){
+    PiMat <- matrix(DatObsCurrInp$Pi,ncol = 1)
+  } else {
+    PiMat <- DatObsCurrInp$Pi
+  }
+  
+  OneMinusPiProd <- (1-PiMat[,1])
+  if(ncol(PiMat)>1){
+    for(k in 2:ncol(PiMat)){
+      OneMinusPiProd <- OneMinusPiProd*(1-PiMat[,k])
+    }
+  }
+  
+  #Calculating caligraphic Y values from Section 4.2
+  DiffInfluenceSq <- DiffInfluenceFunctionsCalib^2 
+  
+  hat_cursiveRhoVec <- knn.reg(train = DatProxyCalibStd,test = ProxyDatStd,y = DiffInfluenceSq,k = kInp)$pred
+  piUnstd <- sqrt(hat_cursiveRhoVec/OneMinusPiProd)
+  
+  return(piUnstd)
+}
+
+```
+
+
+```{r}
+#Compute estimates of the (unstandardized, unclipped) greedy optimal sampling probabilities
+#for each strata (See Section 4.2.2 in paper) 
+
+NeymanLikeSampling <- function(DiffInfluenceFunctionsCalib,DatObsCurrInp,WCurrInp){
+  StrataVec <- DatObsCurrInp$StrataVec
+  NperStrata <- table(StrataVec)
+  NSamp <- nrow(DatObsCurrInp$ProxyDat)
+  NStrata <- length(NperStrata)
+  IdxCompleteCurr <- rowSums(DatObsCurrInp$Iobs)>0
+  WCalib <- WCurrInp[IdxCompleteCurr]
+  StrataVecCalib <- StrataVec[IdxCompleteCurr]
+  
+  
+  if(ncol(DatObsCurrInp$Pi)==1){
+    PiMat <- matrix(DatObsCurrInp$Pi,ncol = 1)
+  } else {
+    PiMat <- DatObsCurrInp$Pi
+  }
+  
+  OneMinusPiProd <- (1-PiMat[,1])
+  if(ncol(PiMat)>1){
+    for(k in 2:ncol(PiMat)){
+      OneMinusPiProd <- OneMinusPiProd*(1-PiMat[,k])
+    }
+  }
+  
+  
+   HatCursiveRhoStrat <- rep(NA,NStrata)
+
+
+  for(l in 1:NStrata){
+    HatCursiveRhoStrat[l] <- sum(WCalib*as.numeric(I(StrataVecCalib==l))*(DiffInfluenceFunctionsCalib^2))/(NperStrata[l]) 
+  }
+  
+
+  #Print warning if conditional expectations in some strata cannot be evaluated
+  #Imputing conditional expectations in such cases
+  if(sum(is.na(HatCursiveRhoStrat))>0){
+    print("HatCursiveRhoStrat has NaN values. Setting to 1 (if all NaN values) or the mean from other strata (if not)")
+    if(mean(is.na(HatCursiveRhoStrat))==1){
+      HatCursiveRhoStrat <- rep(1,NStrata)
+    } else{
+      HatCursiveRhoStrat[is.na(HatCursiveRhoStrat)] <- mean(HatCursiveRhoStrat,na.rm = T) 
+    }
+  }
+  
+   
+   HatCursiveRhoStratVec <- rep(NA,NSamp)
+  for(l in 1:NStrata){
+    HatCursiveRhoStratVec[StrataVec==l] <- HatCursiveRhoStrat[l]
+  }
+   
+  piCurrWaveNonNormalized <- sqrt(HatCursiveRhoStratVec/OneMinusPiProd)
+ 
+
+  return(piCurrWaveNonNormalized)
+}
+```
+
+
+
+
+
+```{r}
+#Implement a single wave of Phase 2
+Phase2RunWave <- function(DatObsInp,GoodDatUnobsInp,nTarg,strategy="uniform",argsStrategy=NULL,overlapThreshFactor=0.01){
+
+  GoodDatObsCurr <- DatObsInp$GoodDat
+  idxIncomplete <- !complete.cases(GoodDatObsCurr)
+  N <- nrow(GoodDatObsCurr)
+  
+  NUnlabled <- sum(idxIncomplete)
+  
+  if(strategy=="uniform"){
+    PiCurrWave <- rep(nTarg/NUnlabled,N)
+    IdxToLabel <- idxIncomplete & (runif(N) < PiCurrWave)
+  }
+  
+  if(strategy %in% c("NeymanUntunedPTD","ActiveKNNUntunedPTD")){     #
+     
+   
+    
+     if(strategy=="NeymanUntunedPTD"){
+     PiCurrWaveNonnormalized <- NeymanLikeSampling(DiffInfluenceFunctionsCalib = argsStrategy$DiffInfluenceCalib,DatObsCurrInp = DatObsInp,WCurrInp = argsStrategy$WCurrWave)
+     } else if(strategy=="ActiveKNNUntunedPTD"){
+      PiCurrWaveNonnormalized <- KNNActivePTDWave(DiffInfluenceFunctionsCalib = argsStrategy$DiffInfluenceCalib,DatObsCurrInp = DatObsInp,WCurrInp = argsStrategy$WCurrWave)
+     }
+    
+ ######################################################################################   
+ ########### Enforcing budget and overlap constraints (see Appendix E.3) ##############
+ ######################################################################################   
+     
+     #Step 1: Normalizing
+      PiCurrWaveNormalized <- nTarg*PiCurrWaveNonnormalized/sum(as.numeric(idxIncomplete)*PiCurrWaveNonnormalized)
+
+     
+     
+      #Step 2: Trimming Pi to lie satisfy overlap constraint
+    #Since bTarg=overlapThreshFactor*nTarg/NUnlabled the following statement
+    #checks that bTarg < nTarg/NUnlabled < 1 - bTarg and that the trimming strategy is feasible
+     if(nTarg/NUnlabled> (1/(1+overlapThreshFactor))){print("Warning not enough unlabelled points remain for proposed sampling scheme")}  
+      
+     bTarg <- overlapThreshFactor * nTarg/NUnlabled
+     
+    
+     PiCurrWaveClipped <- PiCurrWaveNormalized
+     PiCurrWaveClipped[PiCurrWaveNormalized < bTarg] <- bTarg
+     PiCurrWaveClipped[PiCurrWaveNormalized > (1-bTarg)] <- 1-bTarg
+
+     
+     #Step 3: rebalancing budget if trimming resulted in going over or under the budget
+     CurrBudgetUsed <- sum(PiCurrWaveClipped[idxIncomplete]) 
+     if(abs(CurrBudgetUsed - nTarg) < 0.000001){
+       PiCurrWave <- PiCurrWaveClipped
+     } else if(CurrBudgetUsed < nTarg){ #Shrink probabilities towards 1-bTarg 
+       alpha1 <- ((1-bTarg)*NUnlabled-nTarg)/((1-bTarg)*NUnlabled-CurrBudgetUsed)
+       PiCurrWave <- 1-bTarg-alpha1*(1-bTarg-PiCurrWaveClipped)
+     } else if(CurrBudgetUsed > nTarg){   #Shrink probabilities towards bTarg 
+       alpha2 <- (nTarg-bTarg*NUnlabled)/(CurrBudgetUsed-bTarg*NUnlabled)
+       PiCurrWave <- bTarg+alpha2*(PiCurrWaveClipped-bTarg)
+     }
+    
+    #Checking budget constraint met nearly precisely
+     if(abs(sum(PiCurrWave[idxIncomplete]) - nTarg)>0.01){
+       print(paste0("Warning: target number of labels in this wave is ",nTarg," but sum of remaining labeling probabilities is ",sum(PiCurrWave[idxIncomplete])))
+     }
+     
+    #Checking overlap constratint is approximately met
+     if( (min(PiCurrWave) < 0.999*bTarg) | (max(PiCurrWave) > (1-0.999*bTarg))){
+       print("Warning range of pi labels is ")
+       print(c(min(PiCurrWave),max(PiCurrWave)))
+     }
+     
+     #Selecting points for labelling in current wave
+     IdxToLabel <- idxIncomplete & (runif(N) < PiCurrWave)
+  }
+  
+  
+  
+  #Storing quantities for next round
+  DatObsUpdated <- DatObsInp
+  DatObsUpdated$GoodDat[IdxToLabel,] <- GoodDatUnobsInp[IdxToLabel,] #Collecting Labels
+  DatObsUpdated$Iobs <- cbind(DatObsInp$Iobs,IdxToLabel)
+  DatObsUpdated$Pi <- cbind(DatObsInp$Pi,PiCurrWave)
+  colnames(DatObsUpdated$Iobs) <- paste0("Wave",seq(1,ncol(DatObsUpdated$Iobs)))
+  colnames(DatObsUpdated$Pi) <- paste0("Wave",seq(1,ncol(DatObsUpdated$Pi)))
+
+  
+  return(list(GoodDatUnobs=GoodDatUnobsInp,datObs=DatObsUpdated))
+
+}
+```
+
+```{r}
+#Helper function to extract Row or Column of interest from a matrix
+ExtractPOI <- function(InputDat,POI,row=T){
+  if(is.matrix(InputDat)){
+    if(row){
+      OutputDat <- InputDat[POI,]
+    } else {
+      OutputDat <- InputDat[,POI]
+    }
+  } else{
+     OutputDat <- InputDat
+  }
+  return(OutputDat)
+}
+```
+
+Function for implementing proxy assisted two-phase multiwave sampling for data-based experiments
+
+```{r}
+# NOTE: PTDRunLocal is a function that takes a proxy dataset, weights, and a labelled dataset as input
+# and returns a tuned, weighted Predict-Then-Debias estimator, its confidence interval, 
+# and estimated differences in influence function terms as an output
+# PTDRunLocal is set by using functions in the WeightedPTDImplementation with,
+# additional specifications other specifications for the estimand of interest 
+
+Run2PhaseMultiWave <- function(NP1,nTargVecInp,cVecInp,P2StrategyVec,nSim=5,GoodDatAllInp,ProxyDatAllInp,StrataAll,PTDRunLocal,ParamOfInterest,alphaInp2=0.1){
+  
+  
+  CIsActivePTD <- matrix(NA,nrow = nSim,ncol = 3) 
+  colnames(CIsActivePTD) <- c("Estimate","CI_lb","CI_ub")
+  
+  CIsPTDUniform <- CIsActivePTD
+  CIsClassicalUniform <- CIsActivePTD
+  nLabelActive <- rep(NA,nSim)
+  nLabelUniform  <- rep(NA,nSim)
+  
+  
+  StartTime <- proc.time()[3]
+  
+  for(i in 1:nSim){
+    
+    if((i %% 100)==1){
+      print(paste0("Simulation ",i," out of ",nSim,".  Time elapsed = ", (proc.time()[3]-StartTime)/60," minutes"))
+    }
+    P1Dat <- Phase1Sampling(GoodDatAll = GoodDatAllInp,ProxyDatAll = ProxyDatAllInp,N = NP1,StrataAll = StrataAll)
+    
+    ###### Uniform Baselines #####################
+    P2DatUnifromAllP2 <-  Phase2RunWave(DatObsInp = P1Dat$datObs,GoodDatUnobs = P1Dat$GoodDatUnobs,nTarg = sum(nTargVecInp),strategy = "uniform")
+    WCurrUniformAll <- ExtractWCurr(DatObsCurrInp2 = P2DatUnifromAllP2$datObs,cVec = 1)
+    FitUniformSampPTD <- PTDRunLocal(ProxyDatInp=P2DatUnifromAllP2$datObs$ProxyDat,
+                                        GoodDatInp=P2DatUnifromAllP2$datObs$GoodDat,
+                                        WeightsInp=WCurrUniformAll,
+                                        alphaInp=alphaInp2)
+    
+    
+    CIsPTDUniform[i,] <- ExtractPOI(FitUniformSampPTD$CIsPTD,POI = ParamOfInterest) 
+    CIsClassicalUniform[i,] <-  ExtractPOI(FitUniformSampPTD$CIsClassical,POI = ParamOfInterest) 
+    nLabelUniform[i] <- sum(complete.cases(P2DatUnifromAllP2$datObs$GoodDat))
+    
+    
+    ####### Multiwave labelling ##############
+    argsStrategyCurr <- list()
+    if(sum(P2StrategyVec %in% c("NeymanUntunedPTD","ActiveKNNUntunedPTD"))>0){ 
+      argsStrategyCurr$cvec <- cVecInp
+    }
+    
+    P2WcurrDat <- P1Dat
+    
+    
+    
+    for(k in 1:length(nTargVecInp)){
+      P2WcurrDat <-  Phase2RunWave(DatObsInp = P2WcurrDat$datObs,GoodDatUnobs = P2WcurrDat$GoodDatUnobs,nTarg = nTargVecInp[k],strategy = P2StrategyVec[k],argsStrategy = argsStrategyCurr)
+      WCurrWave <- ExtractWCurr(DatObsCurrInp2 = P2WcurrDat$datObs,cVec = cVecInp)
+   
+
+      FitWaveCurr <- PTDRunLocal(ProxyDatInp=P2WcurrDat$datObs$ProxyDat,
+                                    GoodDatInp=P2WcurrDat$datObs$GoodDat,
+                                    WeightsInp=WCurrWave,
+                                    alphaInp=alphaInp2)
+      
+      argsStrategyCurr$DiffInfluenceCalib <- ExtractPOI(InputDat = FitWaveCurr$datForLabelingRule$DiffInfluenceCalib, POI = ParamOfInterest,row = F)
+      argsStrategyCurr$WCurrWave <- WCurrWave
+      
+    }
+    
+    
+    CIsActivePTD[i,] <- ExtractPOI(FitWaveCurr$CIsPTD,POI = ParamOfInterest)
+    nLabelActive[i] <- sum(complete.cases(P2WcurrDat$datObs$GoodDat))
+
+  }
+  
+  
+  
+  return(list(CIsActivePTD=CIsActivePTD,CIsPTDUniform=CIsPTDUniform,CIsClassicalUniform=CIsClassicalUniform,nLabelActive=nLabelActive,nLabelUniform=nLabelUniform))
+  
+}
+```
+
+
+Helper functions to run a suite of simulations
+
+
+```{r}
+#Using Cartesian product of quantile bins for variables of interest
+selectStrata <- function(ProxyDatInp,varsForStratif,nStratVar){
+  StartsForEachVar <- list()
+  for(i in 1:length(varsForStratif)){
+    currVarProxy <- ProxyDatInp[[varsForStratif[i]]]
+    StartsCurVar <- rep(NA,length(currVarProxy))
+    
+    #Discrete case
+    if(length(unique(currVarProxy))==nStratVar[i]){
+      CurrVarVals <- unique(currVarProxy)
+      for(j in 1:length(CurrVarVals)){
+        StartsCurVar[currVarProxy==CurrVarVals[j]] <- j
+      }
+      
+    #Continuous case
+    } else{
+      QuantsCurrVar <- quantile(currVarProxy,probs = seq(0,1,length.out = (nStratVar[i]+1)))
+      
+      for(j in 1:(length(QuantsCurrVar)-1)){
+          StartsCurVar[(currVarProxy < QuantsCurrVar[j+1]) & (currVarProxy >= QuantsCurrVar[j])] <- j
+      }
+        StartsCurVar[currVarProxy== QuantsCurrVar[j+1]] <- j
+      
+    }
+    
+    StartsForEachVar[[i]] <- StartsCurVar
+  }
+  
+  ## Combining Strata across variables
+  StratOutCurr <- rep(0,nrow(ProxyDatInp))
+  for(i in 1:length(varsForStratif)){
+    StratOutCurr <- StratOutCurr + (StartsForEachVar[[i]]-1)*prod(nStratVar[i:length(nStratVar)])/nStratVar[i]
+  }
+  return(StratOutCurr+1)
+}
+```
+
+
+```{r}
+#Function that sets first wave to be a large uniform random sample
+#and sets subsequent waves to be adaptive with evenly distributed labelling budget
+BurnUniformThenSingleStrategy <- function(nTargTot,BurnFrac,KPostBrun,StrategyPostBurn="NeymanUntunedPTD"){
+  nTargOut <- c(nTargTot*BurnFrac,rep(nTargTot*(1-BurnFrac)/KPostBrun,KPostBrun))
+  cVecOut <- nTargOut/sum(nTargOut)
+  P2StrategyVecOut <- c("uniform",rep(StrategyPostBurn,KPostBrun))
+  return(list(nTargVec=nTargOut,cVec=cVecOut,P2StrategiesVec=P2StrategyVecOut))
+}
+
+```
+
+
+```{r}
+#Function that runs a suite of simulations across multiple K values
+#and considers both the stratified adaptive strategy (Section 4.2.2) and the kNN-based adaptive strategy (Section 4.2.1)
+runSimsGridK_method <- function(nTargTotInp,NP1Inp,BurnFracInp,KPostBurnGrid,StrategyPostBurnGrid,GoodDatAllInp3,ProxyDatAllInp3,StrataAllInp3,ParamOfInterestInp,RunPTDFuncInp,nSimPerSpec){
+  
+  SimsOut <- list()
+idxSimCurr <- 0
+for(i in 1:length(StrategyPostBurnGrid)){
+  if(StrategyPostBurnGrid[i]=="NeymanUntunedPTD"){
+    StrataAllCurr <- StrataAllInp3
+  } else{
+    StrataAllCurr <- NULL
+  }
+  for(j in 1:length(KPostBurnGrid)){
+    print(paste0(StrategyPostBurnGrid[i]," with K= 1+",KPostBurnGrid[j]))
+      idxSimCurr <- idxSimCurr+1
+      P2ParamsCurr <- BurnUniformThenSingleStrategy(nTargTot = nTargTotInp,BurnFrac = BurnFracInp,KPostBrun = KPostBurnGrid[j],StrategyPostBurn = StrategyPostBurnGrid[i])
+      
+      SimsCurr <- list()
+      SimsCurr$Results <- Run2PhaseMultiWave(NP1 = NP1Inp,nTargVecInp = P2ParamsCurr$nTargVec,cVecInp = P2ParamsCurr$cVec,
+                   P2StrategyVec = P2ParamsCurr$P2StrategiesVec,
+                   StrataAll = StrataAllCurr,nSim = nSimPerSpec,
+                   GoodDatAllInp = GoodDatAllInp3,ProxyDatAllInp = ProxyDatAllInp3,
+                   PTDRunLocal = RunPTDFuncInp,ParamOfInterest = ParamOfInterestInp
+                  )
+      
+      SimsCurr$NPhase1 <- NP1Inp
+      SimsCurr$P2Params <- P2ParamsCurr
+      SimsCurr$StrategyPostBurn <- StrategyPostBurnGrid[i]
+      SimsCurr$K <- KPostBurnGrid[j]+1
+      SimsCurr$BurnFrac <- BurnFracInp
+      SimsCurr$ParamOfInterest <- ParamOfInterestInp
+      SimsOut[[idxSimCurr]] <- SimsCurr
+  }
+}
+ return(SimsOut) 
+}
+```
+
+```{r}
+SimFolderSave <- paste0(getwd(),"/SimulationResults/")
+```
+
+Running and saving simulations
+
+```{r}
+set.seed(1)
+#Housing Price Linear Regression example
+PTDRunLocalHousingPriceLR <- function(ProxyDatInp,GoodDatInp,WeightsInp,alphaInp){
+   out <- weighted_PTD_glm(ProxyDat = ProxyDatInp,GoodDat = GoodDatInp,InputWeights = WeightsInp,OutcomeVarName = "HousingPrice",RegType = "linear",alpha = alphaInp,TuningScheme = "OptDiagonal")
+   
+   return(out)
+}
+  
+StrataHousing <- selectStrata(ProxyDatInp = HousingPriceFormatted$ProxyDat,varsForStratif = c("Nightlights","HousingPrice"),nStratVar = c(5,3))
+
+
+HousingPriceSims <- runSimsGridK_method(nTargTotInp = 1000,NP1Inp = 10000,BurnFracInp = 0.25,
+                    KPostBurnGrid = c(1,5,25),
+                    StrategyPostBurnGrid = c("NeymanUntunedPTD","ActiveKNNUntunedPTD"),
+                    GoodDatAllInp3 = HousingPriceFormatted$GoodDat,
+                    ProxyDatAllInp3 = HousingPriceFormatted$ProxyDat,
+                    StrataAllInp3 = StrataHousing,ParamOfInterestInp = "Nightlights",
+                    RunPTDFuncInp = PTDRunLocalHousingPriceLR,nSimPerSpec = 1000) 
+
+save(HousingPriceSims,file = paste0(SimFolderSave,"HousingPriceSims.RData"))
+```
+
+
+
+
+```{r}
+#Forested Logistic Regression example
+set.seed(2)
+PTDRunLocalForestedLogisticReg <- function(ProxyDatInp,GoodDatInp,WeightsInp,alphaInp){
+   out <- suppressWarnings(weighted_PTD_glm(ProxyDat = ProxyDatInp,GoodDat = GoodDatInp,InputWeights = WeightsInp,OutcomeVarName = "Forested",RegType = "logistic",alpha = alphaInp,TuningScheme = "OptDiagonal"))
+   
+   return(out)
+}
+  
+  
+StrataForested <- selectStrata(ProxyDatInp = ForestCoverFormatted$ProxyDat,varsForStratif = c("Forested","Population"),nStratVar = c(2,6))
+  
+
+ForestedLogRegSims <- runSimsGridK_method(nTargTotInp = 1000,NP1Inp = 10000,BurnFracInp = 0.25,
+                    KPostBurnGrid = c(1,5,25),
+                    StrategyPostBurnGrid = c("NeymanUntunedPTD","ActiveKNNUntunedPTD"),
+                    GoodDatAllInp3 = ForestCoverFormatted$GoodDat,
+                    ProxyDatAllInp3 = ForestCoverFormatted$ProxyDat,
+                    StrataAllInp3 = StrataForested,ParamOfInterestInp = "Population",
+                    RunPTDFuncInp = PTDRunLocalForestedLogisticReg,nSimPerSpec = 1000)
+
+save(ForestedLogRegSims,file = paste0(SimFolderSave,"ForestedLogRegSims.RData"))
+```
+
+
+```{r}
+#Alpha-Fold Logistic Regression example 
+set.seed(3)
+
+PTDRunLocalAlphaFoldLogisticReg <- function(ProxyDatInp,GoodDatInp,WeightsInp,alphaInp){
+   out <- suppressWarnings(weighted_PTD_glm(ProxyDat = ProxyDatInp,GoodDat = GoodDatInp,InputWeights = WeightsInp,OutcomeVarName = "IDR",RegType = "logistic",alpha = alphaInp,TuningScheme = "OptDiagonal"))
+   
+   return(out)
+}
+  
+StrataAlphaFold <- selectStrata(ProxyDatInp = AlphaFoldFormatted$ProxyDat,varsForStratif = c("ubiquitinated","acetylated"),nStratVar = c(2,2)) 
+  
+  
+AlphaFoldSims <- runSimsGridK_method(nTargTotInp = 5000,NP1Inp = 20000,BurnFracInp = 1/3,
+                    KPostBurnGrid = c(1,5,25),StrategyPostBurnGrid = c("NeymanUntunedPTD"),
+                    GoodDatAllInp3 = AlphaFoldFormatted$GoodDat,
+                    ProxyDatAllInp3 = AlphaFoldFormatted$ProxyDat,
+                    StrataAllInp3 = StrataAlphaFold,ParamOfInterestInp = "Interaction",
+                    RunPTDFuncInp = PTDRunLocalAlphaFoldLogisticReg,nSimPerSpec = 1000)
+
+
+
+
+save(AlphaFoldSims,file = paste0(SimFolderSave,"AlphaFoldSims.RData"))
+```
+
+
+
+```{r}
+set.seed(4)
+#Quantile treecover estimation
+PTDEstimateQuantileTreecover_q75 <- function(ProxyDatInp,GoodDatInp,WeightsInp,alphaInp){
+   out <- weighted_PTD_quantile(ProxyDat = ProxyDatInp$Treecover,GoodDat = GoodDatInp$Treecover,InputWeights = WeightsInp,q=0.75,alpha = alphaInp,TuningScheme = "OptDiagonal")
+   
+   return(out)
+}
+
+  
+  
+#Create strata for testing
+
+StrataTreecover <- selectStrata(ProxyDatInp = TreecoverFormatted$ProxyDat,varsForStratif = c("Treecover"),nStratVar = c(15)) - 2 
+# Above, we subtract 2 from the strataID numbers because many samples have an estimated treecover of zero
+# this initially results in strata #1 and #2 having zero samples and strata #3 having all samples where the
+# estimated treecover is zero.
+
+
+TreecoverQuantile75Sims <- runSimsGridK_method(nTargTotInp = 1000,NP1Inp = 10000,BurnFracInp = 1/4,
+                    KPostBurnGrid = c(1,5,25),
+                    StrategyPostBurnGrid = c("NeymanUntunedPTD","ActiveKNNUntunedPTD"),
+                    GoodDatAllInp3 = TreecoverFormatted$GoodDat,
+                    ProxyDatAllInp3 = TreecoverFormatted$ProxyDat,
+                    StrataAllInp3 = StrataTreecover,ParamOfInterestInp = NULL,
+                    RunPTDFuncInp = PTDEstimateQuantileTreecover_q75,nSimPerSpec = 1000)
+
+save(TreecoverQuantile75Sims,file = paste0(SimFolderSave,"TreecoverQuantile75Sims.RData"))
+
+```
+
+
+Linear regression simulation
+```{r}
+#Generating data
+
+set.seed(5)
+MSuper <- 3 * 10^6
+X <- rnorm(n = MSuper,mean = 0,sd = 1)
+Z <- rbinom(n = MSuper,size = 1,prob = 0.5)
+epsilonY <- rnorm(n = MSuper,mean = 0,sd = 1)+10*Z*rnorm(n = MSuper,mean = 0,sd = 1)+abs(X)*rnorm(n = MSuper,mean = 0,sd = 1)+3*Z*abs(X)*rnorm(n = MSuper,mean = 0,sd = 1)
+Y <-  X + Z + epsilonY
+LogitsTildeZUncent <- 4*Z+Y/sd(Y)+X
+PtildeZgivRest <- exp(LogitsTildeZUncent-mean(LogitsTildeZUncent))/(1+exp(LogitsTildeZUncent-mean(LogitsTildeZUncent)))
+tildeZ <- as.integer(I(runif(MSuper)< PtildeZgivRest))
+
+GoodDatFormattedSynth <- data.frame(Y,X,Z)
+ProxyDatFormattedSynth <- data.frame(Y,X,tildeZ)
+names(ProxyDatFormattedSynth) <- c("Y","X","Z")
+
+
+
+#Running simulations for Linear Regression example
+PTDRunLocalLRSynthY <- function(ProxyDatInp,GoodDatInp,WeightsInp,alphaInp){
+   out <- weighted_PTD_glm(ProxyDat = ProxyDatInp,GoodDat = GoodDatInp,InputWeights = WeightsInp,OutcomeVarName = "Y",RegType = "linear",alpha = alphaInp,TuningScheme = "OptDiagonal")
+   
+   return(out)
+}
+  
+StrataSynth <- selectStrata(ProxyDatInp = ProxyDatFormattedSynth,varsForStratif = c("Y","X","Z"),nStratVar = c(3,3,2))
+  
+
+SyntheticRegSims <- runSimsGridK_method(nTargTotInp = 2000,NP1Inp = 20000,
+                                        BurnFracInp = 1/4,KPostBurnGrid = c(1,5,25),
+                    StrategyPostBurnGrid = c("NeymanUntunedPTD","ActiveKNNUntunedPTD"),
+                    GoodDatAllInp3 = GoodDatFormattedSynth,
+                    ProxyDatAllInp3 = ProxyDatFormattedSynth,
+                    StrataAllInp3 = StrataSynth,ParamOfInterestInp = "Z",
+                    RunPTDFuncInp = PTDRunLocalLRSynthY,nSimPerSpec = 1000)
+
+
+trueCoeffZSynth <- lm(Y ~., data = GoodDatFormattedSynth)$coefficients['Z']
+save(SyntheticRegSims,trueCoeffZSynth,file = paste0(SimFolderSave,"SyntheticLinearRegSim.RData"))
+```
+
+
+
+
